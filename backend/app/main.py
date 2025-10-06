@@ -9,15 +9,20 @@ from fastapi.staticfiles import StaticFiles
 import gc
 import shutil
 # ----------------------- CONFIG -----------------------
-MRMS_URL = "https://mrms.ncep.noaa.gov/2D/ReflectivityAtLowestAltitude/"
+UA = "Mozilla/5.0 (mrms-radar/1.0; +render)"
+MRMS_HTTP = "https://mrms.ncep.noaa.gov/2D/ReflectivityAtLowestAltitude/"
+MRMS_S3   = "https://noaa-mrms-pds.s3.amazonaws.com"
+S3_PREFIX = "CONUS/ReflectivityAtLowestAltitude/01.00/"
+
 PATTERN = re.compile(
     r"MRMS_ReflectivityAtLowestAltitude_(?P<res>01\.00)_(?P<ts>\d{8}-\d{6})\.grib2\.gz$"
 )
+
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-REFRESH_SECONDS = 180  # 3 minutes
-GRID_DECIMATE = 4   # 1 = full res, 2 = half res each axis (~1/4 pixels)
-CONUS_BOUNDS = [[24.5, -125.0], [49.5, -66.5]]  # used for Leaflet ImageOverlay
+DATA_DIR   = os.path.join(os.path.dirname(__file__), "data")
+REFRESH_SECONDS = 180
+GRID_DECIMATE   = 4
+CONUS_BOUNDS    = [[24.5, -125.0], [49.5, -66.5]]
 
 os.makedirs(STATIC_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -34,34 +39,41 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # ----------------------- UTILITIES -----------------------
 def find_latest_filename() -> str:
-    r = requests.get(MRMS_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    # Try NOAA HTML directory (works locally)
+    try:
+        r = requests.get(MRMS_HTTP, timeout=20, headers={"User-Agent": UA})
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        names = []
+        for a in soup.find_all("a"):
+            for s in ((a.get_text(strip=True) or ""), (a.get("href") or "")):
+                if PATTERN.search(s):
+                    names.append(s)  # like MRMS_ReflectivityAtLowestAltitude_01.00_YYYYMMDD-HHMMSS.grib2.gz
+                    break
+        if names:
+            names.sort()
+            # return absolute URL so downloader can use it directly
+            return MRMS_HTTP + names[-1]
+    except Exception:
+        pass  # fall through to S3
+
+    # Fallback: S3 list-type=2 XML (reliable from servers)
+    r = requests.get(
+        f"{MRMS_S3}/",
+        params={"list-type": "2", "prefix": S3_PREFIX},
+        timeout=20,
+        headers={"User-Agent": UA},
+    )
     r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    files_100 = []  # 01.00 km
-    files_050 = []  # 00.50 km
-    for a in soup.find_all("a"):
-        for s in ((a.get_text(strip=True) or ""), (a.get("href") or "")):
-            m = PATTERN.search(s)
-            if not m:
-                continue
-            ts = m.group("ts")  # e.g. 20251006-095638
-            res = m.group("res")
-            if res == "01.00":
-                files_100.append((ts, s))
-            else:
-                files_050.append((ts, s))
-            break
-
-    if not files_100 and not files_050:
+    from xml.etree import ElementTree as ET
+    root = ET.fromstring(r.text)
+    ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+    keys = [el.text for el in root.findall(".//s3:Key", ns)]
+    keys = [k for k in keys if PATTERN.search(os.path.basename(k))]
+    if not keys:
         raise RuntimeError("No RALA files found in MRMS directory")
-
-    if files_100:
-        files_100.sort(key=lambda x: x[0])
-        return files_100[-1][1]
-
-    files_050.sort(key=lambda x: x[0])
-    return files_050[-1][1]
+    keys.sort()
+    return f"{MRMS_S3}/{keys[-1]}"  # absolute URL
 
 
 def _looks_like_grib2(path: str) -> bool:
@@ -72,19 +84,25 @@ def _looks_like_grib2(path: str) -> bool:
     except Exception:
         return False
 
-def download_gz(name: str) -> str:
-    url = MRMS_URL + name
+def download_gz(url_or_name: str) -> str:
+    if url_or_name.startswith("http"):
+        url = url_or_name
+        name = os.path.basename(url_or_name)
+    else:
+        url = MRMS_HTTP + url_or_name
+        name = url_or_name
+
     gz_path = os.path.join(DATA_DIR, name)
     grib_path = gz_path[:-3]  # .grib2
 
     def _fetch():
-        with requests.get(url, stream=True, timeout=60, headers={"User-Agent": "Mozilla/5.0"}) as r:
+        with requests.get(url, stream=True, timeout=120, headers={"User-Agent": UA}) as r:
             r.raise_for_status()
             with open(gz_path, "wb") as f:
                 for chunk in r.iter_content(64 * 1024):
                     if chunk:
                         f.write(chunk)
-        # gunzip stream -> .grib2
+        # gunzip to .grib2
         with gzip.open(gz_path, "rb") as gzr, open(grib_path, "wb") as out:
             shutil.copyfileobj(gzr, out, length=64 * 1024)
         try:
@@ -95,15 +113,11 @@ def download_gz(name: str) -> str:
     if not os.path.exists(grib_path):
         _fetch()
 
-    # file sanity check; if bad, retry once
+    # sanity check; retry once if corrupt/short
     if (not os.path.exists(grib_path)) or os.path.getsize(grib_path) < 1024 or not _looks_like_grib2(grib_path):
-        try:
-            if os.path.exists(gz_path):
-                os.remove(gz_path)
-            if os.path.exists(grib_path):
-                os.remove(grib_path)
-        except OSError:
-            pass
+        for p in (gz_path, grib_path):
+            try: os.remove(p)
+            except OSError: pass
         _fetch()
 
     return grib_path
@@ -190,7 +204,7 @@ def write_meta(ts_str: str) -> None:
 
 def refresh_once() -> str:
     name = find_latest_filename()
-    ts = name.split("_")[3].split(".")[0]
+    ts = os.path.basename(name).split("_")[3].split(".")[0]
     grib = download_gz(name)
     out_png = os.path.join(STATIC_DIR, "latest.png")
     try:
