@@ -80,27 +80,45 @@ def _first_data_var(ds: xr.Dataset) -> xr.DataArray:
 
 def grib_to_png(grib_path: str, out_png: str) -> None:
     """
-    Load GRIB2 with xarray+cfgrib, colorize reflectivity to PNG.
-    Transparent for NaN or very low values.
+    Load GRIB2 with xarray+cfgrib and write a *paletted* PNG to keep memory low.
+    Index 0 in the palette is fully transparent for NoData/very-low values.
     """
-    # Open with cfgrib
-    ds = xr.open_dataset(grib_path, engine="cfgrib")
-    da = _first_data_var(ds).astype("float32").load()
-    arr = da.values  # 2D numpy array, units dBZ typically
+    # Open with cfgrib; disable on-disk index to keep writes tiny
+    ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={"indexpath": ""})
+    da = _first_data_var(ds)
+    a = da.values  # ndarray
 
-    # Mask invalid/very low values
-    mask = ~np.isfinite(arr) | (arr < -5)
+    # Scale to palette indices [0..255]; 0 = transparent (NoData/very low)
     vmin, vmax = 0.0, 75.0
-    norm = np.clip((arr - vmin) / (vmax - vmin), 0, 1)
+    a = a.astype("float32", copy=False)
+    a[~np.isfinite(a)] = -9999.0
 
-    # Use a nice perceptual colormap
-    cmap = plt.get_cmap("turbo")
-    rgba = (cmap(norm) * 255).astype("uint8")
-    rgba[mask, 3] = 0  # transparent where invalid
+    idx = ((a - vmin) * (255.0 / (vmax - vmin))).astype("int16", copy=False)
+    idx[idx < 1] = 0                      # reserve 0 for transparent
+    idx[idx > 255] = 255
 
-    # Save RGBA PNG
+    # make NoData/very low transparent
+    low_mask = (a < -5.0) | (a == -9999.0)
+    idx[low_mask] = 0
+
+    pal_idx = idx.astype("uint8", copy=False)
+
+    # Build a 256-color palette (RGB) using matplotlib's "turbo"
     from PIL import Image
-    Image.fromarray(rgba, mode="RGBA").save(out_png, optimize=True)
+    import matplotlib
+    cmap = matplotlib.colormaps.get("turbo")
+    palette = []
+    for i in range(256):
+        r, g, b, _ = cmap(i / 255.0)
+        palette.extend([int(r * 255), int(g * 255), int(b * 255)])
+
+    im = Image.fromarray(pal_idx, mode="P")
+    im.putpalette(palette)
+    # Per-index alpha: index 0 fully transparent; others opaque
+    im.info["transparency"] = bytes([0] + [255] * 255)
+
+    im.save(out_png, optimize=True)
+
 
 
 def write_meta(ts_str: str) -> None:
