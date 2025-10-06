@@ -10,7 +10,7 @@ import gc
 
 # ----------------------- CONFIG -----------------------
 MRMS_URL = "https://mrms.ncep.noaa.gov/2D/ReflectivityAtLowestAltitude/"
-PATTERN = re.compile(r"MRMS_ReflectivityAtLowestAltitude_01\.00_\d{8}-\d{6}\.grib2\.gz$")
+PATTERN = re.compile(r"MRMS_ReflectivityAtLowestAltitude_00\.50_\d{8}-\d{6}\.grib2\.gz$")
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 REFRESH_SECONDS = 180  # 3 minutes
