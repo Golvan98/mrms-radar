@@ -251,11 +251,15 @@ def health():
 @app.get("/api/latest-meta")
 async def latest_meta():
     meta = _meta_path()
-    if os.path.exists(meta):
-        with open(meta) as f:
-            return json.load(f)
-    # No decode here—just tell client to call force-refresh explicitly
-    return {"error": "Data not yet available. Call /api/force-refresh.", "bounds": CONUS_BOUNDS}
+    if not os.path.exists(meta):
+        # Do a one-time on-demand refresh so the first request works.
+        try:
+            ts = await refresh_once_async()
+            return {"timestamp": ts, "bounds": CONUS_BOUNDS}
+        except Exception as e:
+            return {"error": f"refresh failed: {e}", "bounds": CONUS_BOUNDS}
+    with open(meta) as f:
+        return json.load(f)
 
 @app.get("/api/force-refresh")
 async def force_refresh():

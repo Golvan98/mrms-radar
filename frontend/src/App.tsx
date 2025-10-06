@@ -59,19 +59,30 @@ export default function App() {
   const [meta, setMeta] = useState<Meta | null>(null);
 
   useEffect(() => {
-    const load = async () => {
-      try {
-        const r = await fetch(`${API_BASE}/api/latest-meta`);
-        const j: Meta = await r.json();
+  const load = async () => {
+    try {
+      const r = await fetch(`${API_BASE}/api/latest-meta`);
+      const j = await r.json();
+
+      // If the backend hasn't generated a PNG yet, trigger a one-time refresh
+      if (!j.timestamp) {
+        console.log("No timestamp found, triggering force-refresh...");
+        await fetch(`${API_BASE}/api/force-refresh`);
+        const r2 = await fetch(`${API_BASE}/api/latest-meta`);
+        const j2 = await r2.json();
+        setMeta(j2);
+      } else {
         setMeta(j);
-      } catch (e) {
-        console.error("meta fetch failed", e);
       }
-    };
-    load();
-    const timer = setInterval(load, 120000);
-    return () => clearInterval(timer);
-  }, []);
+    } catch (e) {
+      console.error("meta fetch failed", e);
+    }
+  };
+
+  load(); // run immediately
+  const timer = setInterval(load, 120000); // refresh every 2 minutes
+  return () => clearInterval(timer);
+}, []);
 
   const bounds: LatLngBoundsExpression =
     meta?.bounds || [
