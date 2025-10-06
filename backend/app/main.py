@@ -9,33 +9,37 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-# ----------------------- CONFIG -----------------------
-UA = "Mozilla/5.0 (mrms-radar/1.0; +render)"
-MRMS_HTTP = "https://mrms.ncep.noaa.gov/2D/ReflectivityAtLowestAltitude/"
-MRMS_S3   = "https://noaa-mrms-pds.s3.amazonaws.com"
+# ===============================================================
+# CONFIG
+# ===============================================================
+UA         = "Mozilla/5.0 (mrms-radar/1.0; +render)"
+MRMS_HTTP  = "https://mrms.ncep.noaa.gov/2D/ReflectivityAtLowestAltitude/"
+MRMS_S3    = "https://noaa-mrms-pds.s3.amazonaws.com"
 
-# IMPORTANT: Use ONLY 01.00° (coarsest) on 512 MiB tier
+# Try 00.50 first (more commonly present), then 01.00; both are okay on 512 MiB with aggressive decimation.
 S3_PREFIXES = [
+    "CONUS/ReflectivityAtLowestAltitude_00.50/",
     "CONUS/ReflectivityAtLowestAltitude_01.00/",
 ]
 
-# Accept 01.00 only (keep pattern strict)
 PATTERN = re.compile(
-    r"MRMS_ReflectivityAtLowestAltitude_(?P<res>01\.00)_(?P<ts>\d{8}-\d{6})\.grib2\.gz$"
+    r"MRMS_ReflectivityAtLowestAltitude_(?P<res>00\.50|01\.00)_(?P<ts>\d{8}-\d{6})\.grib2\.gz$"
 )
 
-BASE_DIR    = os.path.dirname(__file__)
-STATIC_DIR  = os.path.join(BASE_DIR, "static")
-DATA_DIR    = os.path.join(BASE_DIR, "data")
-
-# Aggressive decimation by default; you can lower to 8 if memory allows
-REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "600"))
-GRID_DECIMATE   = max(8, int(os.getenv("GRID_DECIMATE", "16")))
-CONUS_BOUNDS    = [[24.5, -125.0], [49.5, -66.5]]
-
+BASE_DIR   = os.path.dirname(__file__)
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+DATA_DIR   = os.path.join(BASE_DIR, "data")
 os.makedirs(STATIC_DIR, exist_ok=True)
 os.makedirs(DATA_DIR,   exist_ok=True)
 
+# keep memory low
+REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "900"))
+GRID_DECIMATE   = max(8, int(os.getenv("GRID_DECIMATE", "16")))
+CONUS_BOUNDS    = [[24.5, -125.0], [49.5, -66.5]]
+
+# ===============================================================
+# APP
+# ===============================================================
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -47,8 +51,11 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 _refresh_lock = asyncio.Lock()
 
-# ----------------------- UTILITIES -----------------------
+# ===============================================================
+# UTILITIES
+# ===============================================================
 def _s3_list_latest(prefix: str) -> Optional[str]:
+    """Return absolute URL for newest .grib2.gz under a given S3 prefix."""
     params = {"list-type": "2", "prefix": prefix, "max-keys": "500"}
     r = requests.get(f"{MRMS_S3}/", params=params, timeout=20, headers={"User-Agent": UA})
     r.raise_for_status()
@@ -56,7 +63,6 @@ def _s3_list_latest(prefix: str) -> Optional[str]:
     from xml.etree import ElementTree as ET
     root = ET.fromstring(r.text)
     ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
-
     keys = [el.text for el in root.findall(".//s3:Key", ns)]
     matches = [k for k in keys if PATTERN.search(os.path.basename(k))]
     if not matches:
@@ -65,29 +71,29 @@ def _s3_list_latest(prefix: str) -> Optional[str]:
     return f"{MRMS_S3}/{matches[-1]}"
 
 def find_latest_filename() -> str:
-    # 1) Try the NOAA HTML directory (often fine locally)
+    """Newest RALA (.grib2.gz). Prefer NOAA HTML; fall back to S3 00.50 then 01.00."""
+    # 1) NOAA HTML dir
     try:
         r = requests.get(MRMS_HTTP, timeout=20, headers={"User-Agent": UA})
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-        names = []
-        for a in soup.find_all("a"):
-            for s in ((a.get_text(strip=True) or ""), (a.get("href") or "")):
-                if PATTERN.search(s):
-                    names.append(s)
-                    break
+        names = [
+            (a.get("href") or "")
+            for a in soup.find_all("a")
+            if a.get("href") and PATTERN.search(a.get("href"))
+        ]
         if names:
             names.sort()
             return MRMS_HTTP + names[-1]
     except Exception:
         pass
 
-    # 2) S3 listing (strict 01.00° only)
+    # 2) S3 dirs
     for pfx in S3_PREFIXES:
         url = _s3_list_latest(pfx)
         if url:
             return url
-    raise RuntimeError(f"No RALA 01.00 files found (tried: {', '.join(S3_PREFIXES)})")
+    raise RuntimeError("No MRMS RALA files found in expected prefixes.")
 
 def _looks_like_grib2(path: str) -> bool:
     try:
@@ -97,14 +103,10 @@ def _looks_like_grib2(path: str) -> bool:
         return False
 
 def download_gz(url_or_name: str) -> str:
-    if url_or_name.startswith("http"):
-        url = url_or_name
-        name = os.path.basename(url_or_name)
-    else:
-        url = MRMS_HTTP + url_or_name
-        name = url_or_name
-
-    gz_path = os.path.join(DATA_DIR, name)
+    """Download .gz and decompress to .grib2."""
+    url  = url_or_name if url_or_name.startswith("http") else MRMS_HTTP + url_or_name
+    name = os.path.basename(url_or_name)
+    gz_path   = os.path.join(DATA_DIR, name)
     grib_path = gz_path[:-3]
 
     def _fetch():
@@ -123,13 +125,11 @@ def download_gz(url_or_name: str) -> str:
 
     if not os.path.exists(grib_path):
         _fetch()
-
     if (not os.path.exists(grib_path)) or os.path.getsize(grib_path) < 1024 or not _looks_like_grib2(grib_path):
         for p in (gz_path, grib_path):
             try: os.remove(p)
             except OSError: pass
         _fetch()
-
     return grib_path
 
 def _make_palette() -> list[int]:
@@ -148,48 +148,33 @@ def _make_palette() -> list[int]:
         for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
             if t <= t1:
                 f = 0.0 if t1 == t0 else (t - t0) / (t1 - t0)
-                r = int(c0[0] * (1 - f) + c1[0] * f)
-                g = int(c0[1] * (1 - f) + c1[1] * f)
-                b = int(c0[2] * (1 - f) + c1[2] * f)
-                pal.extend([r, g, b])
+                pal.extend([
+                    int(c0[0]*(1-f)+c1[0]*f),
+                    int(c0[1]*(1-f)+c1[1]*f),
+                    int(c0[2]*(1-f)+c1[2]*f),
+                ])
                 break
     return pal
 
 def grib_to_png(grib_path: str, out_png: str) -> None:
-    """
-    Memory-conscious: open, slice aggressively, close immediately.
-    NOTE: cfgrib typically loads full field when you access .values.
-    On 01.00° + GRID_DECIMATE>=16 this fits under 512 MiB.
-    """
+    """Convert GRIB → paletted PNG with minimal memory use."""
     gc.collect()
-    # Restrict to the first message only; disable persistent index file
-    ds = xr.open_dataset(
-        grib_path,
-        engine="cfgrib",
-        backend_kwargs={"indexpath": ""}
-    )
+    ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={"indexpath": ""})
     try:
-        # pick first data var
         for _, da in ds.data_vars.items():
             break
-
-        # Access .values (loads); immediately downsample in-place
+        # Load then immediately decimate to shrink RSS; 16x is safe on free tier
         arr = da.values.astype("float32", copy=False)[::GRID_DECIMATE, ::GRID_DECIMATE]
 
-        # Free dataset ASAP
-        try:
-            ds.close()
-        except Exception:
-            pass
+        try: ds.close()
+        except Exception: pass
         del da
         gc.collect()
 
-        # Post-process on the small array
         mask = ~np.isfinite(arr) | (arr < -5.0)
         norm = np.clip((arr - 0.0) / 75.0, 0.0, 1.0)
-        idx = (norm * 254 + 1).astype("uint8", copy=False)
+        idx  = (norm * 254 + 1).astype("uint8", copy=False)
         idx[mask] = 0
-
         del arr, mask, norm
         gc.collect()
 
@@ -198,14 +183,11 @@ def grib_to_png(grib_path: str, out_png: str) -> None:
         im.putpalette(_make_palette())
         im.info["transparency"] = bytes([0] + [255] * 255)
         im.save(out_png, optimize=True)
-
         del idx, im
         gc.collect()
     finally:
-        try:
-            ds.close()
-        except Exception:
-            pass
+        try: ds.close()
+        except Exception: pass
 
 def _meta_path() -> str:
     return os.path.join(STATIC_DIR, "latest.json")
@@ -216,43 +198,43 @@ def write_meta(ts_str: str) -> None:
 
 async def refresh_once_async() -> str:
     async with _refresh_lock:
-        # nuke old GRIBs to keep disk+RSS low
+        # nuke leftovers first
         for f in os.listdir(DATA_DIR):
             if f.endswith(".grib2"):
                 try: os.remove(os.path.join(DATA_DIR, f))
                 except: pass
 
         name = find_latest_filename()
-        ts = os.path.basename(name).split("_")[3].split(".")[0]
+        ts   = os.path.basename(name).split("_")[3].split(".")[0]
         grib = download_gz(name)
+
         out_png = os.path.join(STATIC_DIR, "latest.png")
         grib_to_png(grib, out_png)
         write_meta(ts)
 
-        # remove grib ASAP
         try: os.remove(grib)
         except: pass
-
         gc.collect()
         return ts
 
-# ----------------------- ROUTES -----------------------
+# ===============================================================
+# ROUTES
+# ===============================================================
 @app.get("/")
 def root():
-    return {"ok": True, "service": "mrms-radar", "time_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())}
+    return {"ok": True, "service": "mrms-radar", "utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())}
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# IMPORTANT: do NOT auto-refresh on startup on the 512 MiB plan
-# (keeps the process tiny so Render sees the port and marks service healthy)
+# do NOT auto-refresh on startup (keeps memory tiny until first real request)
 
 @app.get("/api/latest-meta")
 async def latest_meta():
     meta = _meta_path()
     if not os.path.exists(meta):
-        # Do a one-time on-demand refresh so the first request works.
+        # one-time on-demand refresh so the first visit works
         try:
             ts = await refresh_once_async()
             return {"timestamp": ts, "bounds": CONUS_BOUNDS}
