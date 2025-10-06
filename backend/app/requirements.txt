@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+xarray
+cfgrib
+matplotlib
+pillow
+requests
+beautifulsoup4

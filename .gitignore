@@ -1,0 +1,14 @@
+# python
+venv/
+__pycache__/
+*.pyc
+
+# node
+frontend/node_modules/
+frontend/build/
+
+# generated runtime artifacts from the government website
+backend/app/data/
+backend/app/static/latest.png
+backend/app/static/latest.json
+EOF
