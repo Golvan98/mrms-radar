@@ -3,7 +3,7 @@ venv/
 __pycache__/
 *.pyc
 
-# node
+# node 
 frontend/node_modules/
 frontend/build/
 
@@ -12,3 +12,5 @@ backend/app/data/
 backend/app/static/latest.png
 backend/app/static/latest.json
 EOF
+
+.env
