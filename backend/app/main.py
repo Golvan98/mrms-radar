@@ -74,7 +74,11 @@ def download_gz(name: str) -> str:
     grib_path = gz_path[:-3]  # remove .gz
     if not os.path.exists(grib_path):
         with gzip.open(gz_path, "rb") as gzr, open(grib_path, "wb") as out:
-            out.write(gzr.read())
+            shutil.copyfileobj(gzr, out, length=1024 * 64)
+        try:
+            os.remove(gz_path)
+        except OSError:
+            pass
     return grib_path
 
 
