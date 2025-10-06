@@ -10,11 +10,13 @@ import gc
 
 # ----------------------- CONFIG -----------------------
 MRMS_URL = "https://mrms.ncep.noaa.gov/2D/ReflectivityAtLowestAltitude/"
-PATTERN = re.compile(r"MRMS_ReflectivityAtLowestAltitude_00\.50_\d{8}-\d{6}\.grib2\.gz$")
+PATTERN = re.compile(
+    r"MRMS_ReflectivityAtLowestAltitude_(?P<res>01\.00|00\.50)_(?P<ts>\d{8}-\d{6})\.grib2\.gz$"
+)
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 REFRESH_SECONDS = 180  # 3 minutes
-GRID_DECIMATE = 2   # 1 = full res, 2 = half res each axis (~1/4 pixels)
+GRID_DECIMATE = 3   # 1 = full res, 2 = half res each axis (~1/4 pixels)
 CONUS_BOUNDS = [[24.5, -125.0], [49.5, -66.5]]  # used for Leaflet ImageOverlay
 
 os.makedirs(STATIC_DIR, exist_ok=True)
@@ -32,27 +34,31 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # ----------------------- UTILITIES -----------------------
 def find_latest_filename() -> str:
-    """Scrape MRMS directory and return latest RALA filename."""
     r = requests.get(MRMS_URL, timeout=20)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
-
-    
-    names = []
+    candidates = []
     for a in soup.find_all("a"):
         text = (a.get_text(strip=True) or "")
-        href = a.get("href", "")
-        if PATTERN.search(text):
-            names.append(text)
-        elif PATTERN.search(href):
-            names.append(href)
+        href = a.get("href", "") or ""
+        for s in (text, href):
+            m = PATTERN.search(s)
+            if m:
+                ts = m.group("ts")      # e.g. 20251006-075838
+                res = m.group("res")    # "01.00" or "00.50"
+                # Keep the real filename we matched on
+                # (prefer href if present; text is fine too)
+                name = s
+                candidates.append((ts, res, name))
+                break
 
-
-    if not names:
+    if not candidates:
         raise RuntimeError("No RALA files found in MRMS directory")
-    names.sort()  # lexicographic works because timestamp format is sortable
-    return names[-1]
+
+    # Sort by timestamp, then prefer 01.00 over 00.50 when timestamps tie
+    candidates.sort(key=lambda x: (x[0], 0 if x[1] == "01.00" else 1))
+    return candidates[-1][2]
 
 
 def download_gz(name: str) -> str:
