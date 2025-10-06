@@ -1,0 +1,24 @@
+app = "mrms-radar"            # change if taken
+primary_region = "sin"        # pick a region near you
+
+[build]
+  dockerfile = "backend/Dockerfile"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_start_machines = true
+  auto_stop_machines = false
+  min_machines_running = 1
+
+[checks.health]
+  type = "http"
+  port = 8080
+  interval = "30s"
+  timeout = "5s"
+  method = "GET"
+  path = "/health"
+
+[vm]
+  size = "shared-cpu-1x"
+  memory = "1024"

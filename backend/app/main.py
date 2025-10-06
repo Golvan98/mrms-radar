@@ -10,20 +10,17 @@ from fastapi.staticfiles import StaticFiles
 # ----------------------- CONFIG -----------------------
 UA = "Mozilla/5.0 (mrms-radar/1.0; +render)"
 MRMS_HTTP = "https://mrms.ncep.noaa.gov/2D/ReflectivityAtLowestAltitude/"
-MRMS_S3   = "https://noaa-mrms-pds.s3.amazonaws.com"
-
+MRMS_S3 = "https://noaa-mrms-pds.s3.amazonaws.com"
 # Correct S3 prefix (note the underscore, not /01.00/)
 S3_PREFIX = os.getenv("MRMS_S3_PREFIX", "CONUS/ReflectivityAtLowestAltitude_01.00/")
-
 PATTERN = re.compile(
     r"MRMS_ReflectivityAtLowestAltitude_(?P<res>01\.00)_(?P<ts>\d{8}-\d{6})\.grib2\.gz$"
 )
-
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
-DATA_DIR   = os.path.join(os.path.dirname(__file__), "data")
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "180"))
-GRID_DECIMATE   = int(os.getenv("GRID_DECIMATE", "4"))
-CONUS_BOUNDS    = [[24.5, -125.0], [49.5, -66.5]]
+GRID_DECIMATE = int(os.getenv("GRID_DECIMATE", "4"))
+CONUS_BOUNDS = [[24.5, -125.0], [49.5, -66.5]]
 
 os.makedirs(STATIC_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -36,7 +33,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
 
 # ----------------------- UTILITIES -----------------------
 def find_latest_filename() -> str:
@@ -66,7 +62,6 @@ def find_latest_filename() -> str:
     }
     r = requests.get(f"{MRMS_S3}/", params=params, timeout=20, headers={"User-Agent": UA})
     r.raise_for_status()
-
     from xml.etree import ElementTree as ET
     root = ET.fromstring(r.text)
     ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
@@ -92,7 +87,6 @@ def find_latest_filename() -> str:
 
     if not candidates:
         raise RuntimeError(f"No RALA files found in MRMS directory (prefix={S3_PREFIX})")
-
     candidates.sort()
     return f"{MRMS_S3}/{candidates[-1]}"
 
@@ -134,7 +128,6 @@ def download_gz(url_or_name: str) -> str:
 
     if not os.path.exists(grib_path):
         _fetch()
-
     # sanity check; retry once if corrupt/short
     if (not os.path.exists(grib_path)) or os.path.getsize(grib_path) < 1024 or not _looks_like_grib2(grib_path):
         for p in (gz_path, grib_path):
@@ -184,7 +177,6 @@ def grib_to_png(grib_path: str, out_png: str) -> None:
     try:
         da = _first_data_var(ds)
         arr = da.values.astype("float32", copy=False)
-
         if GRID_DECIMATE > 1:
             arr = arr[::GRID_DECIMATE, ::GRID_DECIMATE]
 
@@ -251,7 +243,20 @@ def health():
 
 @app.on_event("startup")
 async def _startup():
-    # Kick off background refresher
+    # Don't block startup - do initial refresh in background
+    asyncio.create_task(_initial_refresh())
+
+
+async def _initial_refresh():
+    """Non-blocking initial refresh that won't crash the server on startup."""
+    await asyncio.sleep(2)  # Let server start first
+    try:
+        print("[MRMS] Starting initial refresh...")
+        refresh_once()
+        print("[MRMS] Initial refresh complete")
+    except Exception as e:
+        print(f"[MRMS] Initial refresh failed (will retry in background): {e}")
+    # Start the continuous refresher loop
     asyncio.create_task(refresher_loop())
 
 
@@ -260,14 +265,10 @@ def latest_meta():
     """Return timestamp + bounds; frontend uses it to refresh overlay."""
     meta_path = os.path.join(STATIC_DIR, "latest.json")
     if os.path.exists(meta_path):
-        return json.load(open(meta_path))
-
-    # cold start: try one refresh, but fail gracefully
-    try:
-        ts = refresh_once()
-        return {"timestamp": ts, "bounds": CONUS_BOUNDS}
-    except Exception as e:
-        return {"error": f"refresh failed: {e}", "bounds": CONUS_BOUNDS}, 503
+        with open(meta_path) as f:
+            return json.load(f)
+    # cold start: return basic info
+    return {"error": "Data not yet available", "bounds": CONUS_BOUNDS}
 
 
 # Optional: quick S3 debug to verify prefix/connectivity on Render
@@ -280,5 +281,11 @@ def debug_s3_head():
     root = ET.fromstring(r.text)
     ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
     keys = [el.text for el in root.findall(".//s3:Key", ns)]
-    tail = keys[-10:]
+    tail = keys[-10:] if len(keys) >= 10 else keys
     return {"prefix": S3_PREFIX, "count": len(keys), "tail": tail}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
