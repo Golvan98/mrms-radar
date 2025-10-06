@@ -7,16 +7,16 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import gc
-
+import shutil
 # ----------------------- CONFIG -----------------------
 MRMS_URL = "https://mrms.ncep.noaa.gov/2D/ReflectivityAtLowestAltitude/"
 PATTERN = re.compile(
-    r"MRMS_ReflectivityAtLowestAltitude_(?P<res>01\.00|00\.50)_(?P<ts>\d{8}-\d{6})\.grib2\.gz$"
+    r"MRMS_ReflectivityAtLowestAltitude_(?P<res>01\.00)_(?P<ts>\d{8}-\d{6})\.grib2\.gz$"
 )
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 REFRESH_SECONDS = 180  # 3 minutes
-GRID_DECIMATE = 3   # 1 = full res, 2 = half res each axis (~1/4 pixels)
+GRID_DECIMATE = 4   # 1 = full res, 2 = half res each axis (~1/4 pixels)
 CONUS_BOUNDS = [[24.5, -125.0], [49.5, -66.5]]  # used for Leaflet ImageOverlay
 
 os.makedirs(STATIC_DIR, exist_ok=True)
@@ -34,51 +34,78 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # ----------------------- UTILITIES -----------------------
 def find_latest_filename() -> str:
-    r = requests.get(MRMS_URL, timeout=20)
+    r = requests.get(MRMS_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
-    candidates = []
+    files_100 = []  # 01.00 km
+    files_050 = []  # 00.50 km
     for a in soup.find_all("a"):
-        text = (a.get_text(strip=True) or "")
-        href = a.get("href", "") or ""
-        for s in (text, href):
+        for s in ((a.get_text(strip=True) or ""), (a.get("href") or "")):
             m = PATTERN.search(s)
-            if m:
-                ts = m.group("ts")      # e.g. 20251006-075838
-                res = m.group("res")    # "01.00" or "00.50"
-                # Keep the real filename we matched on
-                # (prefer href if present; text is fine too)
-                name = s
-                candidates.append((ts, res, name))
-                break
+            if not m:
+                continue
+            ts = m.group("ts")  # e.g. 20251006-095638
+            res = m.group("res")
+            if res == "01.00":
+                files_100.append((ts, s))
+            else:
+                files_050.append((ts, s))
+            break
 
-    if not candidates:
+    if not files_100 and not files_050:
         raise RuntimeError("No RALA files found in MRMS directory")
 
-    # Sort by timestamp, then prefer 01.00 over 00.50 when timestamps tie
-    candidates.sort(key=lambda x: (x[0], 0 if x[1] == "01.00" else 1))
-    return candidates[-1][2]
+    if files_100:
+        files_100.sort(key=lambda x: x[0])
+        return files_100[-1][1]
 
+    files_050.sort(key=lambda x: x[0])
+    return files_050[-1][1]
+
+
+def _looks_like_grib2(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4)
+        return head == b"GRIB"
+    except Exception:
+        return False
 
 def download_gz(name: str) -> str:
     url = MRMS_URL + name
     gz_path = os.path.join(DATA_DIR, name)
-    if not os.path.exists(gz_path):
-        with requests.get(url, stream=True, timeout=60) as r:
+    grib_path = gz_path[:-3]  # .grib2
+
+    def _fetch():
+        with requests.get(url, stream=True, timeout=60, headers={"User-Agent": "Mozilla/5.0"}) as r:
             r.raise_for_status()
             with open(gz_path, "wb") as f:
-                for chunk in r.iter_content(1024 * 64):
-                    f.write(chunk)
-    # decompress .gz -> .grib2
-    grib_path = gz_path[:-3]  # remove .gz
-    if not os.path.exists(grib_path):
+                for chunk in r.iter_content(64 * 1024):
+                    if chunk:
+                        f.write(chunk)
+        # gunzip stream -> .grib2
         with gzip.open(gz_path, "rb") as gzr, open(grib_path, "wb") as out:
-            shutil.copyfileobj(gzr, out, length=1024 * 64)
+            shutil.copyfileobj(gzr, out, length=64 * 1024)
         try:
             os.remove(gz_path)
         except OSError:
             pass
+
+    if not os.path.exists(grib_path):
+        _fetch()
+
+    # file sanity check; if bad, retry once
+    if (not os.path.exists(grib_path)) or os.path.getsize(grib_path) < 1024 or not _looks_like_grib2(grib_path):
+        try:
+            if os.path.exists(gz_path):
+                os.remove(gz_path)
+            if os.path.exists(grib_path):
+                os.remove(grib_path)
+        except OSError:
+            pass
+        _fetch()
+
     return grib_path
 
 
@@ -162,15 +189,30 @@ def write_meta(ts_str: str) -> None:
 
 
 def refresh_once() -> str:
-    """
-    Fetch the newest MRMS RALA, convert to static/latest.png + latest.json.
-    Returns timestamp string.
-    """
-    name = find_latest_filename()  # e.g. MRMS_RALA_00.50_20251006-053530.grib2.gz
-    ts = name.split("_")[3].split(".")[0]  # 20251006-053530
+    name = find_latest_filename()
+    ts = name.split("_")[3].split(".")[0]
     grib = download_gz(name)
     out_png = os.path.join(STATIC_DIR, "latest.png")
-    grib_to_png(grib, out_png)
+    try:
+        grib_to_png(grib, out_png)
+    except Exception as e:
+        # if we picked a 00.50, try latest 01.00 as a fallback
+        if "_00.50_" in name:
+            try:
+                # force 01.00
+                old_pattern = r"(?P<res>01\.00|00\.50)"
+                # quick re-scan but prefer 01.00 only
+                rname = find_latest_filename()  # will pick 01.00 if present due to new logic
+                if "_01.00_" in rname:
+                    grib = download_gz(rname)
+                    grib_to_png(grib, out_png)
+                    ts = rname.split("_")[3].split(".")[0]
+                else:
+                    raise e
+            except Exception:
+                raise e
+        else:
+            raise e
     write_meta(ts)
     return ts
 
