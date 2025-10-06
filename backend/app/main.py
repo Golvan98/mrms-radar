@@ -11,8 +11,8 @@ from fastapi.staticfiles import StaticFiles
 UA = "Mozilla/5.0 (mrms-radar/1.0; +render)"
 MRMS_HTTP = "https://mrms.ncep.noaa.gov/2D/ReflectivityAtLowestAltitude/"
 MRMS_S3 = "https://noaa-mrms-pds.s3.amazonaws.com"
-# Correct S3 prefix (note the underscore, not /01.00/)
-S3_PREFIX = os.getenv("MRMS_S3_PREFIX", "CONUS/ReflectivityAtLowestAltitude_01.00/")
+# Fixed S3 prefix - note the different format for S3 vs HTTP
+S3_PREFIX = os.getenv("MRMS_S3_PREFIX", "CONUS/ReflectivityAtLowestAltitude/")
 PATTERN = re.compile(
     r"MRMS_ReflectivityAtLowestAltitude_(?P<res>01\.00)_(?P<ts>\d{8}-\d{6})\.grib2\.gz$"
 )
@@ -37,7 +37,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # ----------------------- UTILITIES -----------------------
 def find_latest_filename() -> str:
     """Return absolute URL for newest 01.00 RALA .grib2.gz."""
-    # Try NOAA HTML directory (often works locally; may be flaky on servers)
+    # Try NOAA HTML directory first
     try:
         r = requests.get(MRMS_HTTP, timeout=20, headers={"User-Agent": UA})
         r.raise_for_status()
@@ -51,8 +51,8 @@ def find_latest_filename() -> str:
         if names:
             names.sort()
             return MRMS_HTTP + names[-1]
-    except Exception:
-        pass  # fall through to S3
+    except Exception as e:
+        print(f"[MRMS] HTTP fetch failed: {e}, trying S3...")
 
     # Fallback: S3 list-type=2 XML
     params = {
@@ -60,6 +60,7 @@ def find_latest_filename() -> str:
         "prefix": S3_PREFIX,
         "max-keys": "1000",
     }
+    print(f"[MRMS] Searching S3 with prefix: {S3_PREFIX}")
     r = requests.get(f"{MRMS_S3}/", params=params, timeout=20, headers={"User-Agent": UA})
     r.raise_for_status()
     from xml.etree import ElementTree as ET
@@ -68,9 +69,12 @@ def find_latest_filename() -> str:
 
     def filter_candidates(root_el):
         keys = [el.text for el in root_el.findall(".//s3:Key", ns)]
-        return [k for k in keys if PATTERN.search(os.path.basename(k))]
+        matched = [k for k in keys if PATTERN.search(os.path.basename(k))]
+        print(f"[MRMS] Found {len(keys)} total keys, {len(matched)} matching pattern")
+        return matched
 
     candidates = filter_candidates(root)
+    
     # If nothing matched, try to advance a couple pages
     if not candidates:
         next_token_el = root.find(".//s3:NextContinuationToken", ns)
@@ -87,8 +91,11 @@ def find_latest_filename() -> str:
 
     if not candidates:
         raise RuntimeError(f"No RALA files found in MRMS directory (prefix={S3_PREFIX})")
+    
     candidates.sort()
-    return f"{MRMS_S3}/{candidates[-1]}"
+    latest = f"{MRMS_S3}/{candidates[-1]}"
+    print(f"[MRMS] Latest file: {latest}")
+    return latest
 
 
 def _looks_like_grib2(path: str) -> bool:
@@ -111,13 +118,16 @@ def download_gz(url_or_name: str) -> str:
     grib_path = gz_path[:-3]  # .grib2
 
     def _fetch():
+        print(f"[MRMS] Downloading {url}...")
         with requests.get(url, stream=True, timeout=120, headers={"User-Agent": UA}) as r:
             r.raise_for_status()
             with open(gz_path, "wb") as f:
                 for chunk in r.iter_content(64 * 1024):
                     if chunk:
                         f.write(chunk)
+        print(f"[MRMS] Downloaded {len(open(gz_path, 'rb').read())} bytes")
         # gunzip to .grib2
+        print(f"[MRMS] Decompressing...")
         import shutil as _sh
         with gzip.open(gz_path, "rb") as gzr, open(grib_path, "wb") as out:
             _sh.copyfileobj(gzr, out, length=64 * 1024)
@@ -125,11 +135,13 @@ def download_gz(url_or_name: str) -> str:
             os.remove(gz_path)
         except OSError:
             pass
+        print(f"[MRMS] Decompressed to {grib_path}")
 
     if not os.path.exists(grib_path):
         _fetch()
     # sanity check; retry once if corrupt/short
     if (not os.path.exists(grib_path)) or os.path.getsize(grib_path) < 1024 or not _looks_like_grib2(grib_path):
+        print(f"[MRMS] GRIB file appears corrupt, re-downloading...")
         for p in (gz_path, grib_path):
             try:
                 os.remove(p)
@@ -173,6 +185,7 @@ def _make_palette() -> list[int]:
 
 def grib_to_png(grib_path: str, out_png: str) -> None:
     """Load GRIB2 with xarray+cfgrib and write a paletted PNG (index 0 transparent)."""
+    print(f"[MRMS] Processing GRIB to PNG...")
     ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={"indexpath": ""})
     try:
         da = _first_data_var(ds)
@@ -196,6 +209,7 @@ def grib_to_png(grib_path: str, out_png: str) -> None:
         im.putpalette(_make_palette())
         im.info["transparency"] = bytes([0] + [255] * 255)
         im.save(out_png, optimize=True)
+        print(f"[MRMS] PNG saved to {out_png}")
     finally:
         try:
             ds.close()
