@@ -1,18 +1,19 @@
 # backend/app/main.py
-import os, io, re, gzip, time, asyncio, requests
+import os, re, gzip, asyncio, requests, gc, shutil, json
 import numpy as np
 import xarray as xr  # cfgrib provides the engine
 from bs4 import BeautifulSoup
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-import gc
-import shutil
+
 # ----------------------- CONFIG -----------------------
 UA = "Mozilla/5.0 (mrms-radar/1.0; +render)"
 MRMS_HTTP = "https://mrms.ncep.noaa.gov/2D/ReflectivityAtLowestAltitude/"
 MRMS_S3   = "https://noaa-mrms-pds.s3.amazonaws.com"
-S3_PREFIX = "CONUS/ReflectivityAtLowestAltitude/01.00/"
+
+# Correct S3 prefix (note the underscore, not /01.00/)
+S3_PREFIX = os.getenv("MRMS_S3_PREFIX", "CONUS/ReflectivityAtLowestAltitude_01.00/")
 
 PATTERN = re.compile(
     r"MRMS_ReflectivityAtLowestAltitude_(?P<res>01\.00)_(?P<ts>\d{8}-\d{6})\.grib2\.gz$"
@@ -20,8 +21,8 @@ PATTERN = re.compile(
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 DATA_DIR   = os.path.join(os.path.dirname(__file__), "data")
-REFRESH_SECONDS = 180
-GRID_DECIMATE   = 4
+REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "180"))
+GRID_DECIMATE   = int(os.getenv("GRID_DECIMATE", "4"))
 CONUS_BOUNDS    = [[24.5, -125.0], [49.5, -66.5]]
 
 os.makedirs(STATIC_DIR, exist_ok=True)
@@ -39,7 +40,8 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # ----------------------- UTILITIES -----------------------
 def find_latest_filename() -> str:
-    # Try NOAA HTML directory (works locally)
+    """Return absolute URL for newest 01.00 RALA .grib2.gz."""
+    # Try NOAA HTML directory (often works locally; may be flaky on servers)
     try:
         r = requests.get(MRMS_HTTP, timeout=20, headers={"User-Agent": UA})
         r.raise_for_status()
@@ -48,41 +50,60 @@ def find_latest_filename() -> str:
         for a in soup.find_all("a"):
             for s in ((a.get_text(strip=True) or ""), (a.get("href") or "")):
                 if PATTERN.search(s):
-                    names.append(s)  # like MRMS_ReflectivityAtLowestAltitude_01.00_YYYYMMDD-HHMMSS.grib2.gz
+                    names.append(s)
                     break
         if names:
             names.sort()
-            # return absolute URL so downloader can use it directly
             return MRMS_HTTP + names[-1]
     except Exception:
         pass  # fall through to S3
 
-    # Fallback: S3 list-type=2 XML (reliable from servers)
-    r = requests.get(
-        f"{MRMS_S3}/",
-        params={"list-type": "2", "prefix": S3_PREFIX},
-        timeout=20,
-        headers={"User-Agent": UA},
-    )
+    # Fallback: S3 list-type=2 XML
+    params = {
+        "list-type": "2",
+        "prefix": S3_PREFIX,
+        "max-keys": "1000",
+    }
+    r = requests.get(f"{MRMS_S3}/", params=params, timeout=20, headers={"User-Agent": UA})
     r.raise_for_status()
+
     from xml.etree import ElementTree as ET
     root = ET.fromstring(r.text)
     ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
-    keys = [el.text for el in root.findall(".//s3:Key", ns)]
-    keys = [k for k in keys if PATTERN.search(os.path.basename(k))]
-    if not keys:
-        raise RuntimeError("No RALA files found in MRMS directory")
-    keys.sort()
-    return f"{MRMS_S3}/{keys[-1]}"  # absolute URL
+
+    def filter_candidates(root_el):
+        keys = [el.text for el in root_el.findall(".//s3:Key", ns)]
+        return [k for k in keys if PATTERN.search(os.path.basename(k))]
+
+    candidates = filter_candidates(root)
+    # If nothing matched, try to advance a couple pages
+    if not candidates:
+        next_token_el = root.find(".//s3:NextContinuationToken", ns)
+        tries = 0
+        while next_token_el is not None and tries < 2 and not candidates:
+            params2 = dict(params)
+            params2["continuation-token"] = next_token_el.text
+            r2 = requests.get(f"{MRMS_S3}/", params=params2, timeout=20, headers={"User-Agent": UA})
+            r2.raise_for_status()
+            root2 = ET.fromstring(r2.text)
+            candidates = filter_candidates(root2)
+            next_token_el = root2.find(".//s3:NextContinuationToken", ns)
+            tries += 1
+
+    if not candidates:
+        raise RuntimeError(f"No RALA files found in MRMS directory (prefix={S3_PREFIX})")
+
+    candidates.sort()
+    return f"{MRMS_S3}/{candidates[-1]}"
 
 
 def _looks_like_grib2(path: str) -> bool:
     try:
         with open(path, "rb") as f:
-            head = f.read(4)
-        return head == b"GRIB"
+            return f.read(4) == b"GRIB"
     except Exception:
         return False
+
 
 def download_gz(url_or_name: str) -> str:
     if url_or_name.startswith("http"):
@@ -103,8 +124,9 @@ def download_gz(url_or_name: str) -> str:
                     if chunk:
                         f.write(chunk)
         # gunzip to .grib2
+        import shutil as _sh
         with gzip.open(gz_path, "rb") as gzr, open(grib_path, "wb") as out:
-            shutil.copyfileobj(gzr, out, length=64 * 1024)
+            _sh.copyfileobj(gzr, out, length=64 * 1024)
         try:
             os.remove(gz_path)
         except OSError:
@@ -116,23 +138,23 @@ def download_gz(url_or_name: str) -> str:
     # sanity check; retry once if corrupt/short
     if (not os.path.exists(grib_path)) or os.path.getsize(grib_path) < 1024 or not _looks_like_grib2(grib_path):
         for p in (gz_path, grib_path):
-            try: os.remove(p)
-            except OSError: pass
+            try:
+                os.remove(p)
+            except OSError:
+                pass
         _fetch()
 
     return grib_path
 
 
-def _first_data_var(ds: xr.Dataset) -> xr.DataArray:
-    # MRMS/GRIB2 field names vary; pick first data var robustly.
-    for k, v in ds.data_vars.items():
+def _first_data_var(ds: xr.Dataset):
+    for _, v in ds.data_vars.items():
         return v
     raise RuntimeError("No data variables in GRIB dataset")
 
 
 def _make_palette() -> list[int]:
     # Simple blue->cyan->green->yellow->orange->red gradient (256 colors).
-    # Index 0 will be transparent, so its color doesn't matter.
     stops = [
         (0.00, (  0,   0,   0)),
         (0.15, ( 30,  30, 140)),
@@ -155,14 +177,14 @@ def _make_palette() -> list[int]:
                 break
     return pal
 
+
 def grib_to_png(grib_path: str, out_png: str) -> None:
     """Load GRIB2 with xarray+cfgrib and write a paletted PNG (index 0 transparent)."""
     ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={"indexpath": ""})
     try:
         da = _first_data_var(ds)
-        arr = da.values.astype("float32", copy=False)  # ensure 32-bit
+        arr = da.values.astype("float32", copy=False)
 
-        # Optional in-memory decimation to reduce pixels before colorizing
         if GRID_DECIMATE > 1:
             arr = arr[::GRID_DECIMATE, ::GRID_DECIMATE]
 
@@ -180,7 +202,6 @@ def grib_to_png(grib_path: str, out_png: str) -> None:
         from PIL import Image
         im = Image.fromarray(idx, mode="P")
         im.putpalette(_make_palette())
-        # Per-index alpha: index 0 transparent, others opaque
         im.info["transparency"] = bytes([0] + [255] * 255)
         im.save(out_png, optimize=True)
     finally:
@@ -197,7 +218,6 @@ def grib_to_png(grib_path: str, out_png: str) -> None:
 
 def write_meta(ts_str: str) -> None:
     meta_path = os.path.join(STATIC_DIR, "latest.json")
-    import json
     with open(meta_path, "w") as f:
         json.dump({"timestamp": ts_str, "bounds": CONUS_BOUNDS}, f)
 
@@ -207,26 +227,7 @@ def refresh_once() -> str:
     ts = os.path.basename(name).split("_")[3].split(".")[0]
     grib = download_gz(name)
     out_png = os.path.join(STATIC_DIR, "latest.png")
-    try:
-        grib_to_png(grib, out_png)
-    except Exception as e:
-        # if we picked a 00.50, try latest 01.00 as a fallback
-        if "_00.50_" in name:
-            try:
-                # force 01.00
-                old_pattern = r"(?P<res>01\.00|00\.50)"
-                # quick re-scan but prefer 01.00 only
-                rname = find_latest_filename()  # will pick 01.00 if present due to new logic
-                if "_01.00_" in rname:
-                    grib = download_gz(rname)
-                    grib_to_png(grib, out_png)
-                    ts = rname.split("_")[3].split(".")[0]
-                else:
-                    raise e
-            except Exception:
-                raise e
-        else:
-            raise e
+    grib_to_png(grib, out_png)
     write_meta(ts)
     return ts
 
@@ -247,18 +248,37 @@ async def refresher_loop():
 def health():
     return {"status": "ok"}
 
+
 @app.on_event("startup")
 async def _startup():
     # Kick off background refresher
     asyncio.create_task(refresher_loop())
 
+
 @app.get("/api/latest-meta")
 def latest_meta():
     """Return timestamp + bounds; frontend uses it to refresh overlay."""
     meta_path = os.path.join(STATIC_DIR, "latest.json")
-    if not os.path.exists(meta_path):
-        # force one refresh synchronously on cold start
+    if os.path.exists(meta_path):
+        return json.load(open(meta_path))
+
+    # cold start: try one refresh, but fail gracefully
+    try:
         ts = refresh_once()
         return {"timestamp": ts, "bounds": CONUS_BOUNDS}
-    import json
-    return json.load(open(meta_path))
+    except Exception as e:
+        return {"error": f"refresh failed: {e}", "bounds": CONUS_BOUNDS}, 503
+
+
+# Optional: quick S3 debug to verify prefix/connectivity on Render
+@app.get("/api/debug/s3-head")
+def debug_s3_head():
+    params = {"list-type": "2", "prefix": S3_PREFIX, "max-keys": "200"}
+    r = requests.get(f"{MRMS_S3}/", params=params, timeout=20, headers={"User-Agent": UA})
+    r.raise_for_status()
+    from xml.etree import ElementTree as ET
+    root = ET.fromstring(r.text)
+    ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+    keys = [el.text for el in root.findall(".//s3:Key", ns)]
+    tail = keys[-10:]
+    return {"prefix": S3_PREFIX, "count": len(keys), "tail": tail}
