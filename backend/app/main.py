@@ -6,14 +6,15 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from matplotlib import pyplot as plt
+import gc
 
 # ----------------------- CONFIG -----------------------
 MRMS_URL = "https://mrms.ncep.noaa.gov/2D/ReflectivityAtLowestAltitude/"
-PATTERN = re.compile(r"MRMS_ReflectivityAtLowestAltitude_00\.50_\d{8}-\d{6}\.grib2\.gz$")
+PATTERN = re.compile(r"MRMS_ReflectivityAtLowestAltitude_01\.00_\d{8}-\d{6}\.grib2\.gz$")
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 REFRESH_SECONDS = 180  # 3 minutes
+GRID_DECIMATE = 2   # 1 = full res, 2 = half res each axis (~1/4 pixels)
 CONUS_BOUNDS = [[24.5, -125.0], [49.5, -66.5]]  # used for Leaflet ImageOverlay
 
 os.makedirs(STATIC_DIR, exist_ok=True)
@@ -78,56 +79,76 @@ def _first_data_var(ds: xr.Dataset) -> xr.DataArray:
     raise RuntimeError("No data variables in GRIB dataset")
 
 
-def grib_to_png(grib_path: str, out_png: str) -> None:
-    """
-    Load GRIB2 with xarray+cfgrib and write a *paletted* PNG to keep memory low.
-    Index 0 in the palette is fully transparent for NoData/very-low values.
-    """
-    # Open with cfgrib; disable on-disk index to keep writes tiny
-    ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={"indexpath": ""})
-    da = _first_data_var(ds)
-    a = da.values  # ndarray
-
-    # Scale to palette indices [0..255]; 0 = transparent (NoData/very low)
-    vmin, vmax = 0.0, 75.0
-    a = a.astype("float32", copy=False)
-    a[~np.isfinite(a)] = -9999.0
-
-    idx = ((a - vmin) * (255.0 / (vmax - vmin))).astype("int16", copy=False)
-    idx[idx < 1] = 0                      # reserve 0 for transparent
-    idx[idx > 255] = 255
-
-    # make NoData/very low transparent
-    low_mask = (a < -5.0) | (a == -9999.0)
-    idx[low_mask] = 0
-
-    pal_idx = idx.astype("uint8", copy=False)
-
-    # Build a 256-color palette (RGB) using matplotlib's "turbo"
-    from PIL import Image
-    import matplotlib
-    cmap = matplotlib.colormaps.get("turbo")
-    palette = []
+def _make_palette() -> list[int]:
+    # Simple blue->cyan->green->yellow->orange->red gradient (256 colors).
+    # Index 0 will be transparent, so its color doesn't matter.
+    stops = [
+        (0.00, (  0,   0,   0)),
+        (0.15, ( 30,  30, 140)),
+        (0.30, (  0, 120, 255)),
+        (0.50, (  0, 210, 120)),
+        (0.70, (255, 230,   0)),
+        (0.85, (255, 100,   0)),
+        (1.00, (180,   0,  80)),
+    ]
+    pal: list[int] = []
     for i in range(256):
-        r, g, b, _ = cmap(i / 255.0)
-        palette.extend([int(r * 255), int(g * 255), int(b * 255)])
+        t = i / 255.0
+        for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
+            if t <= t1:
+                f = 0.0 if t1 == t0 else (t - t0) / (t1 - t0)
+                r = int(c0[0] * (1 - f) + c1[0] * f)
+                g = int(c0[1] * (1 - f) + c1[1] * f)
+                b = int(c0[2] * (1 - f) + c1[2] * f)
+                pal.extend([r, g, b])
+                break
+    return pal
 
-    im = Image.fromarray(pal_idx, mode="P")
-    im.putpalette(palette)
-    # Per-index alpha: index 0 fully transparent; others opaque
-    im.info["transparency"] = bytes([0] + [255] * 255)
+def grib_to_png(grib_path: str, out_png: str) -> None:
+    """Load GRIB2 with xarray+cfgrib and write a paletted PNG (index 0 transparent)."""
+    ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={"indexpath": ""})
+    try:
+        da = _first_data_var(ds)
+        arr = da.values.astype("float32", copy=False)  # ensure 32-bit
 
-    im.save(out_png, optimize=True)
+        # Optional in-memory decimation to reduce pixels before colorizing
+        if GRID_DECIMATE > 1:
+            arr = arr[::GRID_DECIMATE, ::GRID_DECIMATE]
 
+        # Mask invalid / very low
+        mask = ~np.isfinite(arr) | (arr < -5.0)
+
+        # Normalize 0..75 dBZ -> 0..1
+        vmin, vmax = 0.0, 75.0
+        norm = np.clip((arr - vmin) / (vmax - vmin), 0.0, 1.0)
+
+        # Map to palette indices 1..255 (0 reserved for transparent)
+        idx = (norm * 254 + 1).astype("uint8", copy=False)
+        idx[mask] = 0  # transparent
+
+        from PIL import Image
+        im = Image.fromarray(idx, mode="P")
+        im.putpalette(_make_palette())
+        # Per-index alpha: index 0 transparent, others opaque
+        im.info["transparency"] = bytes([0] + [255] * 255)
+        im.save(out_png, optimize=True)
+    finally:
+        try:
+            ds.close()
+        except Exception:
+            pass
+        if 'da' in locals():
+            del da
+        if 'arr' in locals():
+            del arr
+        gc.collect()
 
 
 def write_meta(ts_str: str) -> None:
     meta_path = os.path.join(STATIC_DIR, "latest.json")
     import json
-    json.dump(
-        {"timestamp": ts_str, "bounds": CONUS_BOUNDS},
-        open(meta_path, "w"),
-    )
+    with open(meta_path, "w") as f:
+        json.dump({"timestamp": ts_str, "bounds": CONUS_BOUNDS}, f)
 
 
 def refresh_once() -> str:
